@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
 from typing import Any
 
 from agentops_domain.enums import ToolKind, ToolSideEffectLevel
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from agentops_api.observability import redact_payload
 
 
 class UserCreate(BaseModel):
@@ -170,6 +173,11 @@ class RunRead(BaseModel):
     created_at: datetime
     updated_at: datetime
 
+    @field_validator("input", "output", mode="before")
+    @classmethod
+    def redact_json(cls, value: Any) -> Any:
+        return redact_payload(value)
+
 
 class RunStepRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -189,6 +197,11 @@ class RunStepRead(BaseModel):
     completed_at: datetime | None
     created_at: datetime
 
+    @field_validator("input", "output", "error", mode="before")
+    @classmethod
+    def redact_json(cls, value: Any) -> Any:
+        return redact_payload(value)
+
 
 class RunEventRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -206,8 +219,77 @@ class RunEventRead(BaseModel):
     span_id: str | None
     created_at: datetime
 
+    @field_validator("payload", mode="before")
+    @classmethod
+    def redact_payload_field(cls, value: Any) -> Any:
+        return redact_payload(value)
+
+
+class UsageRecordRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    run_id: str
+    step_id: str | None
+    provider: str
+    model: str
+    input_tokens: int
+    output_tokens: int
+    cached_input_tokens: int
+    reasoning_tokens: int
+    input_unit_price: Decimal
+    output_unit_price: Decimal
+    currency: str
+    calculated_cost: Decimal
+    pricing_version: str
+    created_at: datetime
+
+
+class RunCostRead(BaseModel):
+    run_id: str
+    currency: str
+    input_tokens: int
+    output_tokens: int
+    cached_input_tokens: int
+    reasoning_tokens: int
+    total_tokens: int
+    total_cost: Decimal
+    records: list[UsageRecordRead]
+
+
+class TraceTreeNode(BaseModel):
+    id: str
+    parent_step_id: str | None
+    node_key: str
+    step_type: str
+    name: str
+    status: str
+    attempt: int
+    started_at: datetime | None
+    completed_at: datetime | None
+    duration_ms: int | None
+    input: dict[str, Any]
+    output: dict[str, Any] | None
+    error: dict[str, Any] | None
+    events: list[RunEventRead]
+    usage: list[UsageRecordRead]
+    children: list[TraceTreeNode] = Field(default_factory=list)
+
+    @field_validator("input", "output", "error", mode="before")
+    @classmethod
+    def redact_json(cls, value: Any) -> Any:
+        return redact_payload(value)
+
 
 class RunTraceRead(BaseModel):
     run: RunRead
     steps: list[RunStepRead]
     events: list[RunEventRead]
+    tree: list[TraceTreeNode] = Field(default_factory=list)
+    usage: list[UsageRecordRead] = Field(default_factory=list)
+    cost: RunCostRead | None = None
+
+
+class WebSocketTicketRead(BaseModel):
+    ticket: str
+    expires_in_seconds: int

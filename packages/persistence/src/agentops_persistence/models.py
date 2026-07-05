@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any
 from uuid import uuid4
 
@@ -12,6 +13,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Integer,
+    Numeric,
     String,
     Text,
     UniqueConstraint,
@@ -264,3 +266,38 @@ class OutboxEvent(Base):
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     attempt_count: Mapped[int] = mapped_column(Integer, default=0)
     last_error: Mapped[str | None] = mapped_column(Text)
+
+
+class UsageRecord(Base):
+    __tablename__ = "usage_records"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    run_id: Mapped[str] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"))
+    step_id: Mapped[str | None] = mapped_column(ForeignKey("run_steps.id", ondelete="SET NULL"))
+    provider: Mapped[str] = mapped_column(String(80))
+    model: Mapped[str] = mapped_column(String(160))
+    input_tokens: Mapped[int] = mapped_column(BigInteger, default=0)
+    output_tokens: Mapped[int] = mapped_column(BigInteger, default=0)
+    cached_input_tokens: Mapped[int] = mapped_column(BigInteger, default=0)
+    reasoning_tokens: Mapped[int] = mapped_column(BigInteger, default=0)
+    input_unit_price: Mapped[Decimal] = mapped_column(Numeric(20, 10), default=Decimal("0"))
+    output_unit_price: Mapped[Decimal] = mapped_column(Numeric(20, 10), default=Decimal("0"))
+    currency: Mapped[str] = mapped_column(String(3), default="USD")
+    calculated_cost: Mapped[Decimal] = mapped_column(Numeric(20, 10), default=Decimal("0"))
+    pricing_version: Mapped[str] = mapped_column(String(120), default="unpriced")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+
+
+class Artifact(Base):
+    __tablename__ = "artifacts"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    run_id: Mapped[str] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"))
+    step_id: Mapped[str | None] = mapped_column(ForeignKey("run_steps.id", ondelete="SET NULL"))
+    kind: Mapped[str] = mapped_column(String(80))
+    storage_uri: Mapped[str] = mapped_column(Text)
+    content_type: Mapped[str] = mapped_column(String(160))
+    size_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
+    sha256: Mapped[str] = mapped_column(String(64))
+    artifact_metadata: Mapped[dict[str, Any]] = mapped_column("metadata", JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)

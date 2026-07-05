@@ -29,6 +29,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from agentops_api.config import Settings
 from agentops_api.errors import ApiError
+from agentops_api.observability import duration_ms, redact_payload, usage_record_for
 from agentops_api.providers import ToolCall, ToolSpec, provider_for
 from agentops_api.tools import ToolBinding, ToolExecutor, tool_output_preview
 
@@ -56,6 +57,7 @@ async def append_run_event(
     step: RunStep | None = None,
     actor_id: str | None = None,
 ) -> RunEvent:
+    safe_payload = redact_payload(payload)
     latest = await session.scalar(
         select(func.coalesce(func.max(RunEvent.sequence_number), 0)).where(
             RunEvent.run_id == run.id
@@ -71,7 +73,7 @@ async def append_run_event(
         event_type=event_type,
         actor_type=actor_type.value,
         actor_id=actor_id,
-        payload=payload,
+        payload=safe_payload,
         trace_id=run.id,
         span_id=step.id if step is not None else None,
     )
@@ -87,7 +89,7 @@ async def append_run_event(
                 "run_id": run.id,
                 "sequence_number": sequence_number,
                 "event_type": event_type,
-                "payload": payload,
+                "payload": safe_payload,
             },
         )
     )
@@ -206,13 +208,24 @@ async def run_agent_loop(
             "usage": result.usage.as_dict(),
         }
         model_step.completed_at = now_utc()
+        session.add(
+            usage_record_for(
+                run=run,
+                step=model_step,
+                agent_version=agent_version,
+                usage=result.usage,
+            )
+        )
         await append_run_event(
             session,
             run=run,
             step=model_step,
             event_type="model.completed",
             actor_type=RunEventActor.AGENT,
-            payload=model_step.output,
+            payload={
+                **model_step.output,
+                "latency_ms": duration_ms(model_step.started_at, model_step.completed_at),
+            },
         )
         await session.commit()
 
@@ -304,7 +317,10 @@ async def execute_tool_calls(
                 step=step,
                 event_type="tool.failed",
                 actor_type=RunEventActor.TOOL,
-                payload=step.error,
+                payload={
+                    **step.error,
+                    "latency_ms": duration_ms(step.started_at, step.completed_at),
+                },
             )
             await session.commit()
             raise ApiError(failure.code, failure.message, 502, failure.details)
@@ -321,6 +337,7 @@ async def execute_tool_calls(
             payload={
                 "tool_version_id": binding.version_id,
                 "output": tool_output_preview(raw_result),
+                "latency_ms": duration_ms(step.started_at, step.completed_at),
             },
         )
         await session.commit()
