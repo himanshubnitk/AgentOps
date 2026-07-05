@@ -1,4 +1,4 @@
-.PHONY: setup infra-up dev-api run-worker test lint migrate migration compose-down
+.PHONY: setup infra-up dev-api run-worker run-relay test lint migrate migration compose-down
 
 setup:
 	uv sync
@@ -11,6 +11,9 @@ dev-api:
 
 run-worker:
 	uv run agentops-worker
+
+run-relay:
+	uv run agentops-relay
 
 test:
 	uv run pytest

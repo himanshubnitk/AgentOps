@@ -15,11 +15,13 @@ dependencies = [
     "httpx>=0.27.0",
     "jsonschema>=4.23.0",
     "pydantic-settings>=2.6.0",
+    "redis>=8.0.1",
     "sqlalchemy[asyncio]>=2.0.0",
     "uvicorn[standard]>=0.32.0",
 ]
 
 [project.scripts]
+agentops-relay = "agentops_api.relay:main"
 agentops-worker = "agentops_api.worker:main"
 
 [dependency-groups]

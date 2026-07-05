@@ -49,6 +49,7 @@ def create_token(
     token_type: str,
     settings: Settings,
     expires_delta: timedelta,
+    claims: dict[str, Any] | None = None,
 ) -> str:
     header = {"alg": "HS256", "typ": "JWT"}
     payload = {
@@ -56,6 +57,10 @@ def create_token(
         "typ": token_type,
         "exp": int((datetime.now(UTC) + expires_delta).timestamp()),
     }
+    if claims:
+        payload.update(
+            {key: value for key, value in claims.items() if key not in {"sub", "typ", "exp"}}
+        )
     signing_input = ".".join(
         [
             _b64encode(json.dumps(header, separators=(",", ":")).encode()),

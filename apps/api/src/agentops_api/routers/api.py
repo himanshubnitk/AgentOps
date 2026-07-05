@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import re
+from collections import defaultdict
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from typing import Any
 
 from agentops_domain.enums import MembershipRole, RunEventActor, RunStatus, VersionStatus
@@ -17,11 +20,12 @@ from agentops_persistence.models import (
     RunStep,
     Tool,
     ToolVersion,
+    UsageRecord,
     User,
     new_id,
     now_utc,
 )
-from fastapi import APIRouter, Depends, Response, status
+from fastapi import APIRouter, Depends, Response, WebSocket, WebSocketDisconnect, status
 from jsonschema import Draft202012Validator, SchemaError
 from sqlalchemy import Select, func, select
 from sqlalchemy.exc import IntegrityError
@@ -31,6 +35,9 @@ from agentops_api.config import get_settings
 from agentops_api.dependencies import get_current_user, get_session
 from agentops_api.errors import ApiError
 from agentops_api.execution import append_run_event, cancel_run, execute_run
+from agentops_api.observability import duration_ms
+from agentops_api.redis_live import open_run_event_subscription
+from agentops_api.relay import run_channel
 from agentops_api.schemas import (
     AgentRead,
     AgentVersionCreate,
@@ -40,6 +47,7 @@ from agentops_api.schemas import (
     OrganizationRead,
     ProjectRead,
     RefreshRequest,
+    RunCostRead,
     RunCreate,
     RunEventRead,
     RunRead,
@@ -49,8 +57,11 @@ from agentops_api.schemas import (
     ToolRead,
     ToolVersionCreate,
     ToolVersionRead,
+    TraceTreeNode,
+    UsageRecordRead,
     UserCreate,
     UserRead,
+    WebSocketTicketRead,
 )
 from agentops_api.security import create_token, decode_token, hash_password, verify_password
 
@@ -250,6 +261,128 @@ def tool_version_hash(version: ToolVersion) -> str:
 async def scoped_list(session: AsyncSession, statement: Select[tuple[Any]]) -> list[Any]:
     result = await session.scalars(statement)
     return list(result.all())
+
+
+async def run_usage_records(session: AsyncSession, run_id: str) -> list[UsageRecord]:
+    result = await session.scalars(
+        select(UsageRecord).where(UsageRecord.run_id == run_id).order_by(UsageRecord.created_at)
+    )
+    return list(result.all())
+
+
+async def latest_run_sequence(session: AsyncSession, run_id: str) -> int:
+    latest = await session.scalar(
+        select(func.coalesce(func.max(RunEvent.sequence_number), 0)).where(
+            RunEvent.run_id == run_id
+        )
+    )
+    return int(latest or 0)
+
+
+async def run_events_after(
+    session: AsyncSession,
+    run_id: str,
+    after_sequence: int,
+    *,
+    limit: int = 100,
+) -> list[RunEvent]:
+    result = await session.scalars(
+        select(RunEvent)
+        .where(RunEvent.run_id == run_id, RunEvent.sequence_number > after_sequence)
+        .order_by(RunEvent.sequence_number.asc())
+        .limit(limit)
+    )
+    return list(result.all())
+
+
+async def send_run_events_after(
+    websocket: WebSocket,
+    session: AsyncSession,
+    run_id: str,
+    after_sequence: int,
+    seen_event_ids: set[str],
+) -> int:
+    last_sequence = after_sequence
+    while True:
+        await session.rollback()
+        events = await run_events_after(session, run_id, last_sequence)
+        if not events:
+            return last_sequence
+        for event in events:
+            last_sequence = max(last_sequence, event.sequence_number)
+            if event.id in seen_event_ids:
+                continue
+            seen_event_ids.add(event.id)
+            await websocket.send_json(
+                {
+                    "type": "event",
+                    "event": RunEventRead.model_validate(event).model_dump(mode="json"),
+                }
+            )
+
+
+def run_cost(run_id: str, records: list[UsageRecord]) -> RunCostRead:
+    currency = records[0].currency if records else "USD"
+    input_tokens = sum(record.input_tokens for record in records)
+    output_tokens = sum(record.output_tokens for record in records)
+    cached_input_tokens = sum(record.cached_input_tokens for record in records)
+    reasoning_tokens = sum(record.reasoning_tokens for record in records)
+    return RunCostRead(
+        run_id=run_id,
+        currency=currency,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cached_input_tokens=cached_input_tokens,
+        reasoning_tokens=reasoning_tokens,
+        total_tokens=input_tokens + output_tokens + cached_input_tokens + reasoning_tokens,
+        total_cost=sum((record.calculated_cost for record in records), Decimal("0")),
+        records=[UsageRecordRead.model_validate(record) for record in records],
+    )
+
+
+def trace_tree(
+    steps: list[RunStep],
+    events: list[RunEvent],
+    usage_records: list[UsageRecord],
+) -> list[TraceTreeNode]:
+    events_by_step: dict[str | None, list[RunEventRead]] = defaultdict(list)
+    for event in events:
+        events_by_step[event.step_id].append(RunEventRead.model_validate(event))
+
+    usage_by_step: dict[str | None, list[UsageRecordRead]] = defaultdict(list)
+    for record in usage_records:
+        usage_by_step[record.step_id].append(UsageRecordRead.model_validate(record))
+
+    nodes = {
+        step.id: TraceTreeNode(
+            id=step.id,
+            parent_step_id=step.parent_step_id,
+            node_key=step.node_key,
+            step_type=step.step_type,
+            name=step.name,
+            status=step.status,
+            attempt=step.attempt,
+            started_at=step.started_at,
+            completed_at=step.completed_at,
+            duration_ms=duration_ms(step.started_at, step.completed_at),
+            input=step.input,
+            output=step.output,
+            error=step.error,
+            events=events_by_step[step.id],
+            usage=usage_by_step[step.id],
+        )
+        for step in steps
+    }
+
+    roots: list[TraceTreeNode] = []
+    for step in steps:
+        node = nodes[step.id]
+        parent = nodes.get(step.parent_step_id or "")
+        if parent is None:
+            roots.append(node)
+        else:
+            parent.children.append(node)
+    return roots
 
 
 async def next_agent_version_number(session: AsyncSession, agent_id: str) -> int:
@@ -739,7 +872,166 @@ async def get_run_trace(
         session,
         select(RunEvent).where(RunEvent.run_id == run_id).order_by(RunEvent.sequence_number.asc()),
     )
-    return RunTraceRead(run=RunRead.model_validate(run), steps=steps, events=events)
+    usage_records = await run_usage_records(session, run_id)
+    return RunTraceRead(
+        run=RunRead.model_validate(run),
+        steps=steps,
+        events=events,
+        tree=trace_tree(steps, events, usage_records),
+        usage=usage_records,
+        cost=run_cost(run_id, usage_records),
+    )
+
+
+@router.get("/runs/{run_id}/cost", response_model=RunCostRead)
+async def get_run_cost(
+    run_id: str,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> RunCostRead:
+    await user_run(session, user, run_id)
+    return run_cost(run_id, await run_usage_records(session, run_id))
+
+
+@router.post("/runs/{run_id}/ws-ticket", response_model=WebSocketTicketRead)
+async def create_run_ws_ticket(
+    run_id: str,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> WebSocketTicketRead:
+    run = await user_run(session, user, run_id)
+    expires_in_seconds = 60
+    return WebSocketTicketRead(
+        ticket=create_token(
+            subject=user.id,
+            token_type="ws",
+            settings=get_settings(),
+            expires_delta=timedelta(seconds=expires_in_seconds),
+            claims={"run_id": run.id, "project_id": run.project_id},
+        ),
+        expires_in_seconds=expires_in_seconds,
+    )
+
+
+@router.websocket("/ws/projects/{project_id}/runs/{run_id}")
+async def run_websocket(
+    websocket: WebSocket,
+    project_id: str,
+    run_id: str,
+    session: AsyncSession = Depends(get_session),
+) -> None:
+    ticket = websocket.query_params.get("ticket")
+    if ticket is None:
+        await websocket.close(code=1008)
+        return
+
+    try:
+        data = decode_token(ticket, settings=get_settings(), token_type="ws")
+    except ApiError:
+        await websocket.close(code=1008)
+        return
+
+    if data.get("run_id") != run_id or data.get("project_id") != project_id:
+        await websocket.close(code=1008)
+        return
+
+    user = await session.scalar(
+        select(User).where(User.id == data["sub"], User.is_active.is_(True))
+    )
+    if user is None:
+        await websocket.close(code=1008)
+        return
+
+    try:
+        run = await user_run(session, user, run_id)
+    except ApiError:
+        await websocket.close(code=1008)
+        return
+    if run.project_id != project_id:
+        await websocket.close(code=1008)
+        return
+
+    await websocket.accept()
+    last_sequence = int(websocket.query_params.get("after_sequence") or 0)
+    seen_event_ids: set[str] = set()
+    await websocket.send_json(
+        {
+            "type": "snapshot",
+            "run": RunRead.model_validate(run).model_dump(mode="json"),
+            "latest_sequence": await latest_run_sequence(session, run_id),
+        }
+    )
+    last_sequence = await send_run_events_after(
+        websocket,
+        session,
+        run_id,
+        last_sequence,
+        seen_event_ids,
+    )
+    current_run = await session.get(Run, run_id, populate_existing=True)
+    if current_run is None:
+        await websocket.close(code=1008)
+        return
+    if (
+        current_run.status
+        in {RunStatus.SUCCEEDED.value, RunStatus.FAILED.value, RunStatus.CANCELLED.value}
+        and last_sequence >= await latest_run_sequence(session, run_id)
+    ):
+        await websocket.send_json({"type": "complete", "latest_sequence": last_sequence})
+        await websocket.close(code=1000)
+        return
+
+    settings = get_settings()
+    async with open_run_event_subscription(settings.redis_url, run_channel(run_id)) as subscription:
+        while True:
+            await session.rollback()
+            current_run = await session.get(Run, run_id, populate_existing=True)
+            if current_run is None:
+                await websocket.close(code=1008)
+                return
+            if (
+                current_run.status
+                in {RunStatus.SUCCEEDED.value, RunStatus.FAILED.value, RunStatus.CANCELLED.value}
+                and last_sequence >= await latest_run_sequence(session, run_id)
+            ):
+                await websocket.send_json({"type": "complete", "latest_sequence": last_sequence})
+                await websocket.close(code=1000)
+                return
+
+            try:
+                message = await asyncio.wait_for(websocket.receive_json(), timeout=0.01)
+                if message.get("type") == "resume":
+                    last_sequence = max(0, int(message.get("after_sequence") or 0))
+                    seen_event_ids.clear()
+                    last_sequence = await send_run_events_after(
+                        websocket,
+                        session,
+                        run_id,
+                        last_sequence,
+                        seen_event_ids,
+                    )
+                elif message.get("type") == "ping":
+                    await websocket.send_json({"type": "pong", "latest_sequence": last_sequence})
+            except TimeoutError:
+                live_event = await subscription.get_message(timeout=0.5)
+                if live_event is not None:
+                    event_id = live_event.get("event_id")
+                    sequence_number = int(live_event.get("sequence_number") or 0)
+                    if not isinstance(event_id, str) or event_id not in seen_event_ids:
+                        if sequence_number > last_sequence:
+                            last_sequence = await send_run_events_after(
+                                websocket,
+                                session,
+                                run_id,
+                                last_sequence,
+                                seen_event_ids,
+                            )
+                else:
+                    await websocket.send_json(
+                        {"type": "heartbeat", "latest_sequence": last_sequence}
+                    )
+            except WebSocketDisconnect:
+                return
 
 
 @router.post(
