@@ -3,9 +3,9 @@ from __future__ import annotations
 import asyncio
 
 from agentops_domain.enums import RunStatus
-from agentops_persistence.models import Run
+from agentops_persistence.models import ApprovalRequest, Run, now_utc
 from agentops_persistence.session import make_session_factory
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 
 from agentops_api.config import get_settings
 from agentops_api.execution import execute_run
@@ -17,7 +17,18 @@ async def run_once(limit: int = 10) -> int:
     async with session_factory() as session:
         result = await session.scalars(
             select(Run.id)
-            .where(Run.status.in_([RunStatus.QUEUED.value, RunStatus.RUNNING.value]))
+            .outerjoin(ApprovalRequest, ApprovalRequest.run_id == Run.id)
+            .where(
+                or_(
+                    Run.status.in_([RunStatus.QUEUED.value, RunStatus.RUNNING.value]),
+                    and_(
+                        Run.status == RunStatus.WAITING_FOR_APPROVAL.value,
+                        ApprovalRequest.status == "pending",
+                        ApprovalRequest.expires_at.is_not(None),
+                        ApprovalRequest.expires_at <= now_utc(),
+                    ),
+                )
+            )
             .order_by(Run.created_at.asc())
             .limit(limit)
         )

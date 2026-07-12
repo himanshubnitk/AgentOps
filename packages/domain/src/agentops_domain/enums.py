@@ -30,6 +30,7 @@ class ToolSideEffectLevel(StrEnum):
 class RunStatus(StrEnum):
     QUEUED = "queued"
     RUNNING = "running"
+    WAITING_FOR_APPROVAL = "waiting_for_approval"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     CANCELLED = "cancelled"
@@ -38,6 +39,7 @@ class RunStatus(StrEnum):
 class RunStepStatus(StrEnum):
     QUEUED = "queued"
     RUNNING = "running"
+    WAITING = "waiting"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     SKIPPED = "skipped"

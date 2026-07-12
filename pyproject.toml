@@ -37,8 +37,9 @@ where = [
     "apps/api/src",
     "packages/domain/src",
     "packages/persistence/src",
+    "packages/sdk-python/src",
 ]
-include = ["agentops_*"]
+include = ["agentops", "agentops_*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
@@ -46,6 +47,7 @@ pythonpath = [
     "apps/api/src",
     "packages/domain/src",
     "packages/persistence/src",
+    "packages/sdk-python/src",
 ]
 testpaths = ["apps/api/tests"]
 
@@ -65,6 +67,7 @@ mypy_path = [
     "apps/api/src",
     "packages/domain/src",
     "packages/persistence/src",
+    "packages/sdk-python/src",
 ]
 
 [[tool.mypy.overrides]]

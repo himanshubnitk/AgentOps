@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import re
+import secrets
 from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -12,6 +15,12 @@ from agentops_domain.hashing import canonical_hash
 from agentops_persistence.models import (
     Agent,
     AgentVersion,
+    ApiKey,
+    ApprovalRequest,
+    Dataset,
+    DatasetCase,
+    Experiment,
+    ExperimentRun,
     Organization,
     OrganizationMembership,
     Project,
@@ -22,10 +31,12 @@ from agentops_persistence.models import (
     ToolVersion,
     UsageRecord,
     User,
+    Workflow,
+    WorkflowVersion,
     new_id,
     now_utc,
 )
-from fastapi import APIRouter, Depends, Response, WebSocket, WebSocketDisconnect, status
+from fastapi import APIRouter, Depends, Header, Response, WebSocket, WebSocketDisconnect, status
 from jsonschema import Draft202012Validator, SchemaError
 from sqlalchemy import Select, func, select
 from sqlalchemy.exc import IntegrityError
@@ -34,6 +45,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from agentops_api.config import get_settings
 from agentops_api.dependencies import get_current_user, get_session
 from agentops_api.errors import ApiError
+from agentops_api.evaluations import deterministic_score, model_judge_score
 from agentops_api.execution import append_run_event, cancel_run, execute_run
 from agentops_api.observability import duration_ms
 from agentops_api.redis_live import open_run_event_subscription
@@ -42,6 +54,17 @@ from agentops_api.schemas import (
     AgentRead,
     AgentVersionCreate,
     AgentVersionRead,
+    ApiKeyCreate,
+    ApiKeyRead,
+    ApprovalDecision,
+    ApprovalRead,
+    DatasetCaseCreate,
+    DatasetCaseRead,
+    DatasetRead,
+    ExperimentCreate,
+    ExperimentRead,
+    ExperimentRunRead,
+    ExternalTraceEvent,
     LoginRequest,
     NamedCreate,
     OrganizationRead,
@@ -57,13 +80,19 @@ from agentops_api.schemas import (
     ToolRead,
     ToolVersionCreate,
     ToolVersionRead,
+    TraceBatchCreate,
+    TraceBatchRead,
     TraceTreeNode,
     UsageRecordRead,
     UserCreate,
     UserRead,
     WebSocketTicketRead,
+    WorkflowRead,
+    WorkflowVersionCreate,
+    WorkflowVersionRead,
 )
 from agentops_api.security import create_token, decode_token, hash_password, verify_password
+from agentops_api.workflows import validate_definition
 
 router = APIRouter()
 
@@ -201,6 +230,73 @@ async def user_tool_version(session: AsyncSession, user: User, version_id: str) 
     return version
 
 
+async def user_workflow(session: AsyncSession, user: User, workflow_id: str) -> Workflow:
+    statement = (
+        select(Workflow)
+        .join(Project, Project.id == Workflow.project_id)
+        .join(
+            OrganizationMembership,
+            OrganizationMembership.organization_id == Project.organization_id,
+        )
+        .where(Workflow.id == workflow_id, OrganizationMembership.user_id == user.id)
+    )
+    workflow = await session.scalar(statement)
+    if workflow is None:
+        raise ApiError("WORKFLOW_NOT_FOUND", "Workflow not found.", 404)
+    return workflow
+
+
+async def user_workflow_version(
+    session: AsyncSession, user: User, version_id: str
+) -> WorkflowVersion:
+    statement = (
+        select(WorkflowVersion)
+        .join(Workflow, Workflow.id == WorkflowVersion.workflow_id)
+        .join(Project, Project.id == Workflow.project_id)
+        .join(
+            OrganizationMembership,
+            OrganizationMembership.organization_id == Project.organization_id,
+        )
+        .where(WorkflowVersion.id == version_id, OrganizationMembership.user_id == user.id)
+    )
+    version = await session.scalar(statement)
+    if version is None:
+        raise ApiError("WORKFLOW_VERSION_NOT_FOUND", "Workflow version not found.", 404)
+    return version
+
+
+async def user_dataset(session: AsyncSession, user: User, dataset_id: str) -> Dataset:
+    statement = (
+        select(Dataset)
+        .join(Project, Project.id == Dataset.project_id)
+        .join(
+            OrganizationMembership,
+            OrganizationMembership.organization_id == Project.organization_id,
+        )
+        .where(Dataset.id == dataset_id, OrganizationMembership.user_id == user.id)
+    )
+    dataset = await session.scalar(statement)
+    if dataset is None:
+        raise ApiError("DATASET_NOT_FOUND", "Dataset not found.", 404)
+    return dataset
+
+
+async def user_approval(session: AsyncSession, user: User, approval_id: str) -> ApprovalRequest:
+    statement = (
+        select(ApprovalRequest)
+        .join(Project, Project.id == ApprovalRequest.project_id)
+        .join(
+            OrganizationMembership,
+            OrganizationMembership.organization_id == Project.organization_id,
+        )
+        .where(ApprovalRequest.id == approval_id, OrganizationMembership.user_id == user.id)
+    )
+    approval = await session.scalar(statement)
+    if approval is None:
+        raise ApiError("APPROVAL_NOT_FOUND", "Approval request not found.", 404)
+    return approval
+
+
 async def user_run(session: AsyncSession, user: User, run_id: str) -> Run:
     statement = (
         select(Run)
@@ -256,6 +352,61 @@ def tool_version_hash(version: ToolVersion) -> str:
             "side_effect_level": version.side_effect_level,
         }
     )
+
+
+def workflow_version_hash(version: WorkflowVersion) -> str:
+    return canonical_hash(version.definition)
+
+
+async def next_workflow_version_number(session: AsyncSession, workflow_id: str) -> int:
+    latest = await session.scalar(
+        select(func.coalesce(func.max(WorkflowVersion.version_number), 0)).where(
+            WorkflowVersion.workflow_id == workflow_id
+        )
+    )
+    return int(latest or 0) + 1
+
+
+async def validate_workflow_dependencies(
+    session: AsyncSession, workflow: Workflow, version: WorkflowVersion
+) -> None:
+    validate_definition(version.definition)
+    for node in version.definition["nodes"]:
+        node_type = node["type"]
+        if node_type == "agent":
+            found = await session.scalar(
+                select(AgentVersion.id)
+                .join(Agent, Agent.id == AgentVersion.agent_id)
+                .where(
+                    AgentVersion.id == node["agent_version_id"],
+                    AgentVersion.status == VersionStatus.PUBLISHED.value,
+                    Agent.project_id == workflow.project_id,
+                )
+            )
+            if found is None:
+                raise ApiError(
+                    "INVALID_WORKFLOW",
+                    "Workflow references an unpublished or cross-project agent version.",
+                    422,
+                    {"node_id": node["id"]},
+                )
+        elif node_type == "tool":
+            found = await session.scalar(
+                select(ToolVersion.id)
+                .join(Tool, Tool.id == ToolVersion.tool_id)
+                .where(
+                    ToolVersion.id == node["tool_version_id"],
+                    ToolVersion.status == VersionStatus.PUBLISHED.value,
+                    Tool.project_id == workflow.project_id,
+                )
+            )
+            if found is None:
+                raise ApiError(
+                    "INVALID_WORKFLOW",
+                    "Workflow references an unpublished or cross-project tool version.",
+                    422,
+                    {"node_id": node["id"]},
+                )
 
 
 async def scoped_list(session: AsyncSession, statement: Select[tuple[Any]]) -> list[Any]:
@@ -972,11 +1123,11 @@ async def run_websocket(
     if current_run is None:
         await websocket.close(code=1008)
         return
-    if (
-        current_run.status
-        in {RunStatus.SUCCEEDED.value, RunStatus.FAILED.value, RunStatus.CANCELLED.value}
-        and last_sequence >= await latest_run_sequence(session, run_id)
-    ):
+    if current_run.status in {
+        RunStatus.SUCCEEDED.value,
+        RunStatus.FAILED.value,
+        RunStatus.CANCELLED.value,
+    } and last_sequence >= await latest_run_sequence(session, run_id):
         await websocket.send_json({"type": "complete", "latest_sequence": last_sequence})
         await websocket.close(code=1000)
         return
@@ -989,11 +1140,11 @@ async def run_websocket(
             if current_run is None:
                 await websocket.close(code=1008)
                 return
-            if (
-                current_run.status
-                in {RunStatus.SUCCEEDED.value, RunStatus.FAILED.value, RunStatus.CANCELLED.value}
-                and last_sequence >= await latest_run_sequence(session, run_id)
-            ):
+            if current_run.status in {
+                RunStatus.SUCCEEDED.value,
+                RunStatus.FAILED.value,
+                RunStatus.CANCELLED.value,
+            } and last_sequence >= await latest_run_sequence(session, run_id):
                 await websocket.send_json({"type": "complete", "latest_sequence": last_sequence})
                 await websocket.close(code=1000)
                 return
@@ -1128,3 +1279,703 @@ async def publish_tool_version(
     await commit(session)
     await session.refresh(version)
     return version
+
+
+@router.post(
+    "/projects/{project_id}/workflows",
+    response_model=WorkflowRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_workflow(
+    project_id: str,
+    request: NamedCreate,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> Workflow:
+    project = await user_project(session, user, project_id)
+    workflow = Workflow(
+        organization_id=project.organization_id,
+        project_id=project.id,
+        name=request.name,
+        slug=request.slug or slugify(request.name),
+        description=request.description,
+        created_by=user.id,
+    )
+    session.add(workflow)
+    await commit(session)
+    await session.refresh(workflow)
+    return workflow
+
+
+@router.get("/projects/{project_id}/workflows", response_model=list[WorkflowRead])
+async def list_workflows(
+    project_id: str,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> list[Workflow]:
+    await user_project(session, user, project_id)
+    return await scoped_list(
+        session,
+        select(Workflow)
+        .where(Workflow.project_id == project_id)
+        .order_by(Workflow.created_at.desc()),
+    )
+
+
+@router.get("/workflows/{workflow_id}", response_model=WorkflowRead)
+async def get_workflow(
+    workflow_id: str,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> Workflow:
+    return await user_workflow(session, user, workflow_id)
+
+
+@router.post(
+    "/workflows/{workflow_id}/versions",
+    response_model=WorkflowVersionRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_workflow_version(
+    workflow_id: str,
+    request: WorkflowVersionCreate,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> WorkflowVersion:
+    workflow = await user_workflow(session, user, workflow_id)
+    validate_definition(request.definition)
+    version = WorkflowVersion(
+        workflow_id=workflow.id,
+        version_number=await next_workflow_version_number(session, workflow.id),
+        definition=request.definition,
+        created_by=user.id,
+    )
+    session.add(version)
+    await commit(session)
+    await session.refresh(version)
+    return version
+
+
+@router.get("/workflows/{workflow_id}/versions", response_model=list[WorkflowVersionRead])
+async def list_workflow_versions(
+    workflow_id: str,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> list[WorkflowVersion]:
+    workflow = await user_workflow(session, user, workflow_id)
+    return await scoped_list(
+        session,
+        select(WorkflowVersion)
+        .where(WorkflowVersion.workflow_id == workflow.id)
+        .order_by(WorkflowVersion.version_number.desc()),
+    )
+
+
+@router.post("/workflow-versions/{version_id}/validate", response_model=WorkflowVersionRead)
+async def validate_workflow_version(
+    version_id: str,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> WorkflowVersion:
+    version = await user_workflow_version(session, user, version_id)
+    workflow = await session.get(Workflow, version.workflow_id)
+    if workflow is None:
+        raise ApiError("WORKFLOW_NOT_FOUND", "Workflow not found.", 404)
+    await validate_workflow_dependencies(session, workflow, version)
+    return version
+
+
+@router.post("/workflow-versions/{version_id}/publish", response_model=WorkflowVersionRead)
+async def publish_workflow_version(
+    version_id: str,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> WorkflowVersion:
+    version = await user_workflow_version(session, user, version_id)
+    if version.status == VersionStatus.PUBLISHED.value:
+        return version
+    workflow = await session.get(Workflow, version.workflow_id)
+    if workflow is None:
+        raise ApiError("WORKFLOW_NOT_FOUND", "Workflow not found.", 404)
+    await validate_workflow_dependencies(session, workflow, version)
+    version.status = VersionStatus.PUBLISHED.value
+    version.definition_hash = workflow_version_hash(version)
+    version.published_at = now_utc()
+    workflow.latest_version_number = max(workflow.latest_version_number, version.version_number)
+    await commit(session)
+    await session.refresh(version)
+    return version
+
+
+@router.post(
+    "/workflow-versions/{version_id}/runs",
+    response_model=RunRead,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def start_workflow_run(
+    version_id: str,
+    request: RunCreate,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> Run:
+    version = await user_workflow_version(session, user, version_id)
+    if version.status != VersionStatus.PUBLISHED.value:
+        raise ApiError("WORKFLOW_VERSION_NOT_PUBLISHED", "Workflow version must be published.", 422)
+    workflow = await session.get(Workflow, version.workflow_id)
+    if workflow is None:
+        raise ApiError("WORKFLOW_NOT_FOUND", "Workflow not found.", 404)
+    if request.idempotency_key:
+        existing = await session.scalar(
+            select(Run).where(
+                Run.project_id == workflow.project_id,
+                Run.idempotency_key == request.idempotency_key,
+            )
+        )
+        if existing is not None:
+            if get_settings().inline_run_execution and not request.defer:
+                existing = await execute_run(session, existing.id, get_settings())
+            return existing
+
+    run_id = new_id()
+    run = Run(
+        id=run_id,
+        organization_id=workflow.organization_id,
+        project_id=workflow.project_id,
+        agent_version_id=None,
+        workflow_version_id=version.id,
+        parent_run_id=None,
+        root_run_id=run_id,
+        temporal_workflow_id=f"local-run-{run_id}",
+        temporal_run_id=None,
+        idempotency_key=request.idempotency_key,
+        status=RunStatus.QUEUED.value,
+        input=request.input,
+        output=None,
+        created_by=user.id,
+    )
+    session.add(run)
+    await session.flush()
+    await append_run_event(
+        session,
+        run=run,
+        event_type="run.queued",
+        actor_type=RunEventActor.API,
+        actor_id=user.id,
+        payload={
+            "workflow_version_id": version.id,
+            "idempotency_key": request.idempotency_key,
+            "deferred": request.defer,
+        },
+    )
+    await commit(session)
+    if get_settings().inline_run_execution and not request.defer:
+        run = await execute_run(session, run.id, get_settings())
+    return run
+
+
+@router.get("/projects/{project_id}/approvals", response_model=list[ApprovalRead])
+async def list_approvals(
+    project_id: str,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> list[ApprovalRequest]:
+    await user_project(session, user, project_id)
+    return await scoped_list(
+        session,
+        select(ApprovalRequest)
+        .where(ApprovalRequest.project_id == project_id)
+        .order_by(ApprovalRequest.created_at.desc()),
+    )
+
+
+async def decide_approval(
+    approval_id: str,
+    approved: bool,
+    request: ApprovalDecision,
+    session: AsyncSession,
+    user: User,
+) -> ApprovalRequest:
+    approval = await user_approval(session, user, approval_id)
+    if approval.status != "pending":
+        raise ApiError("APPROVAL_ALREADY_DECIDED", "Approval request is no longer pending.", 409)
+    if approval.expires_at is not None and approval.expires_at <= now_utc():
+        approval.status = "expired"
+        approval.decision = {"approved": False, "comment": "Approval timed out."}
+        approval.decided_at = now_utc()
+        await commit(session)
+        raise ApiError("APPROVAL_EXPIRED", "Approval request has expired.", 409)
+
+    run = await session.get(Run, approval.run_id)
+    step = await session.get(RunStep, approval.step_id)
+    if run is None or step is None:
+        raise ApiError("APPROVAL_NOT_FOUND", "Approval request is incomplete.", 404)
+    approval.status = "approved" if approved else "rejected"
+    approval.decision = {"approved": approved, "comment": request.comment}
+    approval.decided_by = user.id
+    approval.decided_at = now_utc()
+    await append_run_event(
+        session,
+        run=run,
+        step=step,
+        event_type="approval.approved" if approved else "approval.rejected",
+        actor_type=RunEventActor.USER,
+        actor_id=user.id,
+        payload={"approval_id": approval.id, "comment": request.comment},
+    )
+    run.status = RunStatus.QUEUED.value
+    await append_run_event(
+        session,
+        run=run,
+        event_type="run.queued",
+        actor_type=RunEventActor.USER,
+        actor_id=user.id,
+        payload={"reason": "approval_decided", "approval_id": approval.id},
+    )
+    await commit(session)
+    if get_settings().inline_run_execution:
+        await execute_run(session, run.id, get_settings())
+    await session.refresh(approval)
+    return approval
+
+
+@router.post("/approvals/{approval_id}/approve", response_model=ApprovalRead)
+async def approve(
+    approval_id: str,
+    request: ApprovalDecision,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> ApprovalRequest:
+    return await decide_approval(approval_id, True, request, session, user)
+
+
+@router.post("/approvals/{approval_id}/reject", response_model=ApprovalRead)
+async def reject(
+    approval_id: str,
+    request: ApprovalDecision,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> ApprovalRequest:
+    return await decide_approval(approval_id, False, request, session, user)
+
+
+@router.post(
+    "/projects/{project_id}/datasets",
+    response_model=DatasetRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_dataset(
+    project_id: str,
+    request: NamedCreate,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> Dataset:
+    project = await user_project(session, user, project_id)
+    dataset = Dataset(
+        organization_id=project.organization_id,
+        project_id=project.id,
+        name=request.name,
+        slug=request.slug or slugify(request.name),
+        description=request.description,
+        created_by=user.id,
+    )
+    session.add(dataset)
+    await commit(session)
+    await session.refresh(dataset)
+    return dataset
+
+
+@router.get("/projects/{project_id}/datasets", response_model=list[DatasetRead])
+async def list_datasets(
+    project_id: str,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> list[Dataset]:
+    await user_project(session, user, project_id)
+    return await scoped_list(
+        session,
+        select(Dataset).where(Dataset.project_id == project_id).order_by(Dataset.created_at.desc()),
+    )
+
+
+@router.post(
+    "/datasets/{dataset_id}/cases",
+    response_model=DatasetCaseRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_dataset_case(
+    dataset_id: str,
+    request: DatasetCaseCreate,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> DatasetCase:
+    dataset = await user_dataset(session, user, dataset_id)
+    case = DatasetCase(
+        dataset_id=dataset.id,
+        input=request.input,
+        expected_output=request.expected_output,
+        case_metadata=request.metadata,
+    )
+    session.add(case)
+    await commit(session)
+    await session.refresh(case)
+    return case
+
+
+@router.get("/datasets/{dataset_id}/cases", response_model=list[DatasetCaseRead])
+async def list_dataset_cases(
+    dataset_id: str,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> list[DatasetCase]:
+    dataset = await user_dataset(session, user, dataset_id)
+    return await scoped_list(
+        session,
+        select(DatasetCase)
+        .where(DatasetCase.dataset_id == dataset.id)
+        .order_by(DatasetCase.created_at.asc()),
+    )
+
+
+async def execute_experiment(
+    session: AsyncSession, experiment: Experiment, settings: Any
+) -> Experiment:
+    cases = await scoped_list(
+        session,
+        select(DatasetCase)
+        .where(DatasetCase.dataset_id == experiment.dataset_id)
+        .order_by(DatasetCase.created_at.asc()),
+    )
+    agent_version = (
+        await session.get(AgentVersion, experiment.agent_version_id)
+        if experiment.agent_version_id is not None
+        else None
+    )
+    experiment.status = "running"
+    experiment.started_at = now_utc()
+    await session.commit()
+
+    scores: list[Decimal] = []
+    completed = 0
+    for case in cases:
+        run_id = new_id()
+        run = Run(
+            id=run_id,
+            organization_id=experiment.organization_id,
+            project_id=experiment.project_id,
+            agent_version_id=experiment.agent_version_id,
+            workflow_version_id=experiment.workflow_version_id,
+            parent_run_id=None,
+            root_run_id=run_id,
+            temporal_workflow_id=f"experiment-{experiment.id}-{run_id}",
+            temporal_run_id=None,
+            idempotency_key=None,
+            status=RunStatus.QUEUED.value,
+            input=case.input,
+            output=None,
+            created_by=experiment.created_by,
+        )
+        evaluation_run = ExperimentRun(
+            experiment_id=experiment.id,
+            dataset_case_id=case.id,
+            run_id=run_id,
+            status="running",
+        )
+        session.add_all([run, evaluation_run])
+        await session.flush()
+        await append_run_event(
+            session,
+            run=run,
+            event_type="run.queued",
+            actor_type=RunEventActor.EVALUATOR,
+            payload={"experiment_id": experiment.id, "dataset_case_id": case.id},
+        )
+        await session.commit()
+        run = await execute_run(session, run.id, settings)
+        evaluation_run.status = run.status
+        evaluation_run.completed_at = now_utc()
+        if run.status == RunStatus.SUCCEEDED.value:
+            completed += 1
+            output = run.output or {}
+            deterministic, deterministic_details = deterministic_score(output, case.expected_output)
+            if agent_version is not None:
+                model_score, model_details = await model_judge_score(
+                    output, case.expected_output, agent_version, settings
+                )
+                score = (deterministic + model_score) / Decimal("2")
+            else:
+                model_details = {"type": "not_available_for_workflow"}
+                score = deterministic
+            scores.append(score)
+            evaluation_run.score = score
+            evaluation_run.result = {
+                "deterministic": deterministic_details,
+                "model_based": model_details,
+            }
+            await append_run_event(
+                session,
+                run=run,
+                event_type="evaluation.completed",
+                actor_type=RunEventActor.EVALUATOR,
+                payload={"experiment_id": experiment.id, "score": str(score)},
+            )
+        else:
+            evaluation_run.result = {"error": run.error_message, "status": run.status}
+        await session.commit()
+
+    experiment.status = "succeeded" if completed == len(cases) else "completed_with_failures"
+    experiment.completed_at = now_utc()
+    experiment.summary = {
+        "cases": len(cases),
+        "completed": completed,
+        "success_rate": float(Decimal(completed) / Decimal(len(cases))) if cases else 0.0,
+        "average_score": float(sum(scores, Decimal("0")) / Decimal(len(scores))) if scores else 0.0,
+    }
+    await session.commit()
+    await session.refresh(experiment)
+    return experiment
+
+
+@router.post(
+    "/projects/{project_id}/experiments",
+    response_model=ExperimentRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_experiment(
+    project_id: str,
+    request: ExperimentCreate,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> Experiment:
+    project = await user_project(session, user, project_id)
+    dataset = await user_dataset(session, user, request.dataset_id)
+    if dataset.project_id != project.id:
+        raise ApiError("DATASET_NOT_FOUND", "Dataset not found.", 404)
+    if bool(request.agent_version_id) == bool(request.workflow_version_id):
+        raise ApiError(
+            "INVALID_EXPERIMENT",
+            "Experiment requires exactly one agent or workflow version.",
+            422,
+        )
+    if request.agent_version_id:
+        version = await user_agent_version(session, user, request.agent_version_id)
+        agent = await session.get(Agent, version.agent_id)
+        if (
+            agent is None
+            or agent.project_id != project.id
+            or version.status != VersionStatus.PUBLISHED.value
+        ):
+            raise ApiError(
+                "INVALID_EXPERIMENT", "Agent version must be published in this project.", 422
+            )
+    if request.workflow_version_id:
+        workflow_version = await user_workflow_version(session, user, request.workflow_version_id)
+        workflow = await session.get(Workflow, workflow_version.workflow_id)
+        if (
+            workflow is None
+            or workflow.project_id != project.id
+            or workflow_version.status != VersionStatus.PUBLISHED.value
+        ):
+            raise ApiError(
+                "INVALID_EXPERIMENT", "Workflow version must be published in this project.", 422
+            )
+    experiment = Experiment(
+        organization_id=project.organization_id,
+        project_id=project.id,
+        dataset_id=dataset.id,
+        agent_version_id=request.agent_version_id,
+        workflow_version_id=request.workflow_version_id,
+        created_by=user.id,
+    )
+    session.add(experiment)
+    await commit(session)
+    return await execute_experiment(session, experiment, get_settings())
+
+
+@router.get("/experiments/{experiment_id}", response_model=ExperimentRead)
+async def get_experiment(
+    experiment_id: str,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> Experiment:
+    statement = (
+        select(Experiment)
+        .join(Project, Project.id == Experiment.project_id)
+        .join(
+            OrganizationMembership,
+            OrganizationMembership.organization_id == Project.organization_id,
+        )
+        .where(Experiment.id == experiment_id, OrganizationMembership.user_id == user.id)
+    )
+    experiment = await session.scalar(statement)
+    if experiment is None:
+        raise ApiError("EXPERIMENT_NOT_FOUND", "Experiment not found.", 404)
+    return experiment
+
+
+@router.get("/experiments/{experiment_id}/runs", response_model=list[ExperimentRunRead])
+async def list_experiment_runs(
+    experiment_id: str,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> list[ExperimentRun]:
+    await get_experiment(experiment_id, session, user)
+    return await scoped_list(
+        session,
+        select(ExperimentRun)
+        .where(ExperimentRun.experiment_id == experiment_id)
+        .order_by(ExperimentRun.created_at.asc()),
+    )
+
+
+def new_project_api_key() -> tuple[str, str, str]:
+    prefix = secrets.token_hex(4)
+    secret = secrets.token_urlsafe(32)
+    value = f"aops_{prefix}_{secret}"
+    return prefix, value, hashlib.sha256(value.encode()).hexdigest()
+
+
+async def authenticated_ingestion_key(session: AsyncSession, value: str | None) -> ApiKey:
+    if value is None:
+        raise ApiError("UNAUTHENTICATED", "Project API key required.", 401)
+    parts = value.split("_", 2)
+    if len(parts) != 3 or parts[0] != "aops":
+        raise ApiError("UNAUTHENTICATED", "Project API key is invalid.", 401)
+    api_key = await session.scalar(select(ApiKey).where(ApiKey.prefix == parts[1]))
+    supplied_hash = hashlib.sha256(value.encode()).hexdigest()
+    if (
+        api_key is None
+        or api_key.revoked_at is not None
+        or not hmac.compare_digest(api_key.secret_hash, supplied_hash)
+    ):
+        raise ApiError("UNAUTHENTICATED", "Project API key is invalid.", 401)
+    return api_key
+
+
+@router.post(
+    "/projects/{project_id}/api-keys",
+    response_model=ApiKeyRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_api_key(
+    project_id: str,
+    request: ApiKeyCreate,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> ApiKeyRead:
+    project = await user_project(session, user, project_id)
+    prefix, secret, secret_hash = new_project_api_key()
+    api_key = ApiKey(
+        organization_id=project.organization_id,
+        project_id=project.id,
+        name=request.name,
+        prefix=prefix,
+        secret_hash=secret_hash,
+        created_by=user.id,
+    )
+    session.add(api_key)
+    await commit(session)
+    await session.refresh(api_key)
+    return ApiKeyRead.model_validate(api_key).model_copy(update={"secret": secret})
+
+
+@router.get("/projects/{project_id}/api-keys", response_model=list[ApiKeyRead])
+async def list_api_keys(
+    project_id: str,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> list[ApiKey]:
+    await user_project(session, user, project_id)
+    return await scoped_list(
+        session,
+        select(ApiKey).where(ApiKey.project_id == project_id).order_by(ApiKey.created_at.desc()),
+    )
+
+
+@router.delete("/api-keys/{api_key_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def revoke_api_key(
+    api_key_id: str,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> Response:
+    statement = (
+        select(ApiKey)
+        .join(Project, Project.id == ApiKey.project_id)
+        .join(
+            OrganizationMembership,
+            OrganizationMembership.organization_id == Project.organization_id,
+        )
+        .where(ApiKey.id == api_key_id, OrganizationMembership.user_id == user.id)
+    )
+    api_key = await session.scalar(statement)
+    if api_key is None:
+        raise ApiError("API_KEY_NOT_FOUND", "API key not found.", 404)
+    api_key.revoked_at = now_utc()
+    await commit(session)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+async def external_run_for_event(
+    session: AsyncSession, api_key: ApiKey, event: ExternalTraceEvent
+) -> Run:
+    run = await session.get(Run, event.run_id)
+    if run is not None:
+        if run.project_id != api_key.project_id:
+            raise ApiError("RUN_NOT_FOUND", "Run not found.", 404)
+        return run
+    run = Run(
+        id=event.run_id,
+        organization_id=api_key.organization_id,
+        project_id=api_key.project_id,
+        agent_version_id=None,
+        workflow_version_id=None,
+        parent_run_id=None,
+        root_run_id=event.run_id,
+        temporal_workflow_id=f"external-{event.run_id}",
+        temporal_run_id=None,
+        idempotency_key=None,
+        status=RunStatus.RUNNING.value,
+        input={"external": True},
+        output=None,
+        created_by=None,
+    )
+    session.add(run)
+    await session.flush()
+    return run
+
+
+@router.post("/ingestion/events:batch", response_model=TraceBatchRead)
+async def ingest_trace_events(
+    request: TraceBatchCreate,
+    x_agentops_api_key: str | None = Header(default=None, alias="X-AgentOps-Api-Key"),
+    session: AsyncSession = Depends(get_session),
+) -> TraceBatchRead:
+    api_key = await authenticated_ingestion_key(session, x_agentops_api_key)
+    accepted = 0
+    duplicates: list[str] = []
+    for event in request.events:
+        if await session.get(RunEvent, event.event_id) is not None:
+            duplicates.append(event.event_id)
+            continue
+        run = await external_run_for_event(session, api_key, event)
+        await append_run_event(
+            session,
+            run=run,
+            event_id=event.event_id,
+            event_type=event.event_type,
+            actor_type=RunEventActor.SYSTEM,
+            payload={"external_sequence_number": event.sequence_number, "data": event.payload},
+            trace_id=event.trace_id,
+            span_id=event.span_id,
+            timestamp=event.timestamp,
+        )
+        if run.agent_version_id is None and run.workflow_version_id is None:
+            if event.event_type.endswith(".completed"):
+                run.status = RunStatus.SUCCEEDED.value
+                run.completed_at = event.timestamp
+            elif event.event_type.endswith(".failed"):
+                run.status = RunStatus.FAILED.value
+                run.completed_at = event.timestamp
+        accepted += 1
+    api_key.last_used_at = now_utc()
+    await commit(session)
+    return TraceBatchRead(accepted=accepted, duplicate_event_ids=duplicates)

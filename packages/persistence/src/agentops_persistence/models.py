@@ -174,6 +174,131 @@ class ToolVersion(Base):
     tool: Mapped[Tool] = relationship(back_populates="versions")
 
 
+class Workflow(TimestampMixin, Base):
+    __tablename__ = "workflows"
+    __table_args__ = (UniqueConstraint("project_id", "slug", name="uq_workflows_project_slug"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id", ondelete="CASCADE"))
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"))
+    name: Mapped[str] = mapped_column(String(160))
+    slug: Mapped[str] = mapped_column(String(180))
+    description: Mapped[str | None] = mapped_column(Text)
+    latest_version_number: Mapped[int] = mapped_column(Integer, default=0)
+    created_by: Mapped[str] = mapped_column(ForeignKey("users.id"))
+
+
+class WorkflowVersion(Base):
+    __tablename__ = "workflow_versions"
+    __table_args__ = (
+        UniqueConstraint(
+            "workflow_id", "version_number", name="uq_workflow_versions_workflow_number"
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    workflow_id: Mapped[str] = mapped_column(ForeignKey("workflows.id", ondelete="CASCADE"))
+    version_number: Mapped[int] = mapped_column(Integer)
+    definition: Mapped[dict[str, Any]] = mapped_column(JSON)
+    definition_hash: Mapped[str | None] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(32), default=VersionStatus.DRAFT.value)
+    created_by: Mapped[str] = mapped_column(ForeignKey("users.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ApprovalRequest(Base):
+    __tablename__ = "approval_requests"
+    __table_args__ = (UniqueConstraint("run_id", "node_key", name="uq_approval_requests_run_node"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id", ondelete="CASCADE"))
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"))
+    run_id: Mapped[str] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"))
+    step_id: Mapped[str] = mapped_column(ForeignKey("run_steps.id", ondelete="CASCADE"))
+    node_key: Mapped[str] = mapped_column(String(200))
+    status: Mapped[str] = mapped_column(String(32), default="pending")
+    prompt: Mapped[str] = mapped_column(Text)
+    input: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    decision: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_by: Mapped[str | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    decided_by: Mapped[str | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class Dataset(TimestampMixin, Base):
+    __tablename__ = "datasets"
+    __table_args__ = (UniqueConstraint("project_id", "slug", name="uq_datasets_project_slug"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id", ondelete="CASCADE"))
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"))
+    name: Mapped[str] = mapped_column(String(160))
+    slug: Mapped[str] = mapped_column(String(180))
+    description: Mapped[str | None] = mapped_column(Text)
+    created_by: Mapped[str] = mapped_column(ForeignKey("users.id"))
+
+
+class DatasetCase(TimestampMixin, Base):
+    __tablename__ = "dataset_cases"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    dataset_id: Mapped[str] = mapped_column(ForeignKey("datasets.id", ondelete="CASCADE"))
+    input: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    expected_output: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    case_metadata: Mapped[dict[str, Any]] = mapped_column("metadata", JSON, default=dict)
+
+
+class Experiment(TimestampMixin, Base):
+    __tablename__ = "experiments"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id", ondelete="CASCADE"))
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"))
+    dataset_id: Mapped[str] = mapped_column(ForeignKey("datasets.id", ondelete="CASCADE"))
+    agent_version_id: Mapped[str | None] = mapped_column(ForeignKey("agent_versions.id"))
+    workflow_version_id: Mapped[str | None] = mapped_column(String(36))
+    status: Mapped[str] = mapped_column(String(32), default="queued")
+    summary: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    created_by: Mapped[str] = mapped_column(ForeignKey("users.id"))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ExperimentRun(Base):
+    __tablename__ = "experiment_runs"
+    __table_args__ = (
+        UniqueConstraint("experiment_id", "dataset_case_id", name="uq_experiment_runs_case"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    experiment_id: Mapped[str] = mapped_column(ForeignKey("experiments.id", ondelete="CASCADE"))
+    dataset_case_id: Mapped[str] = mapped_column(ForeignKey("dataset_cases.id", ondelete="CASCADE"))
+    run_id: Mapped[str | None] = mapped_column(ForeignKey("runs.id", ondelete="SET NULL"))
+    status: Mapped[str] = mapped_column(String(32), default="queued")
+    score: Mapped[Decimal | None] = mapped_column(Numeric(10, 4))
+    result: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ApiKey(TimestampMixin, Base):
+    __tablename__ = "api_keys"
+    __table_args__ = (UniqueConstraint("prefix", name="uq_api_keys_prefix"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id", ondelete="CASCADE"))
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"))
+    name: Mapped[str] = mapped_column(String(160))
+    prefix: Mapped[str] = mapped_column(String(24))
+    secret_hash: Mapped[str] = mapped_column(String(64))
+    created_by: Mapped[str] = mapped_column(ForeignKey("users.id"))
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class Run(TimestampMixin, Base):
     __tablename__ = "runs"
     __table_args__ = (

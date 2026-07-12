@@ -293,3 +293,159 @@ class RunTraceRead(BaseModel):
 class WebSocketTicketRead(BaseModel):
     ticket: str
     expires_in_seconds: int
+
+
+class WorkflowRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    organization_id: str
+    project_id: str
+    name: str
+    slug: str
+    description: str | None
+    latest_version_number: int
+    created_at: datetime
+
+
+class WorkflowVersionCreate(BaseModel):
+    definition: dict[str, Any]
+
+
+class WorkflowVersionRead(WorkflowVersionCreate):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    workflow_id: str
+    version_number: int
+    definition_hash: str | None
+    status: str
+    created_at: datetime
+    published_at: datetime | None
+
+
+class ApprovalDecision(BaseModel):
+    comment: str | None = Field(default=None, max_length=2000)
+
+
+class ApprovalRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    organization_id: str
+    project_id: str
+    run_id: str
+    step_id: str
+    node_key: str
+    status: str
+    prompt: str
+    input: dict[str, Any]
+    decision: dict[str, Any] | None
+    expires_at: datetime | None
+    created_by: str | None
+    decided_by: str | None
+    created_at: datetime
+    decided_at: datetime | None
+
+
+class DatasetRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    organization_id: str
+    project_id: str
+    name: str
+    slug: str
+    description: str | None
+    created_at: datetime
+
+
+class DatasetCaseCreate(BaseModel):
+    input: dict[str, Any] = Field(default_factory=dict)
+    expected_output: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class DatasetCaseRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    dataset_id: str
+    input: dict[str, Any]
+    expected_output: dict[str, Any]
+    metadata: dict[str, Any] = Field(validation_alias="case_metadata")
+    created_at: datetime
+    updated_at: datetime
+
+
+class ExperimentCreate(BaseModel):
+    dataset_id: str
+    agent_version_id: str | None = None
+    workflow_version_id: str | None = None
+
+
+class ExperimentRunRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    experiment_id: str
+    dataset_case_id: str
+    run_id: str | None
+    status: str
+    score: Decimal | None
+    result: dict[str, Any] | None
+    created_at: datetime
+    completed_at: datetime | None
+
+
+class ExperimentRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    organization_id: str
+    project_id: str
+    dataset_id: str
+    agent_version_id: str | None
+    workflow_version_id: str | None
+    status: str
+    summary: dict[str, Any] | None
+    created_at: datetime
+    started_at: datetime | None
+    completed_at: datetime | None
+
+
+class ApiKeyCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=160)
+
+
+class ApiKeyRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    project_id: str
+    name: str
+    prefix: str
+    created_at: datetime
+    revoked_at: datetime | None
+    last_used_at: datetime | None
+    secret: str | None = None
+
+
+class ExternalTraceEvent(BaseModel):
+    event_id: str = Field(min_length=1, max_length=36)
+    run_id: str = Field(min_length=1, max_length=36)
+    sequence_number: int = Field(ge=1)
+    event_type: str = Field(min_length=1, max_length=120)
+    timestamp: datetime
+    payload: dict[str, Any] = Field(default_factory=dict)
+    trace_id: str | None = Field(default=None, max_length=64)
+    span_id: str | None = Field(default=None, max_length=64)
+
+
+class TraceBatchCreate(BaseModel):
+    events: list[ExternalTraceEvent] = Field(min_length=1, max_length=1000)
+
+
+class TraceBatchRead(BaseModel):
+    accepted: int
+    duplicate_event_ids: list[str]
